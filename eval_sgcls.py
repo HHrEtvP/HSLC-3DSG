@@ -1,0 +1,489 @@
+import os
+import sys
+import argparse
+import datetime
+
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+
+from model.config import cfg
+from model.modeling.FinalNet import Net
+from model.dataset.rscan_detection_dataset import RScanDetectionVotesDataset
+from model.dataset.model_util_rscan import RScanDatasetConfig as DC
+from my_utils.load_pretrain_model import load_pretrain_model
+from my_utils.make_optimizer import build_optimizer
+from model.modeling.detector.pointnet2.pytorch_utils import BNMomentumScheduler
+from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader
+from my_utils.my_collate_fn import my_collate_fn
+from model.modeling.roi_head.relation_head.loss import make_roi_relation_loss_evaluator
+from model.modeling.roi_head.relation_head.metric_processor import BatchMetricProcessor, RecallKProcessor, REL_parse_gt, \
+    REL_parse_output
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = BASE_DIR
+sys.path.append(os.path.join(ROOT_DIR, 'model'))
+sys.path.append(os.path.join(ROOT_DIR, 'my_utils'))
+sys.path.append(os.path.join(ROOT_DIR, 'scannet'))
+sys.path.append(os.path.join(ROOT_DIR, '3rscan'))
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--log_dir', default='log', help='Dump dir to save model checkpoint [default: log]')
+parser.add_argument('--dump_dir', default=None, help='Dump dir to save sample outputs [default: None]')
+parser.add_argument('--num_points', type=int, default=40000, help='Point Number [default: 40000]')
+parser.add_argument('--num_feature_dim', type=int, default=256, help='Feature Extractor Output Dim [default: 256]')
+parser.add_argument('--ap_iou_thresh', type=float, default=0.25, help='AP IoU threshold [default: 0.25]')
+parser.add_argument('--batch_size', type=int, default=8, help='Batch Size during training [default: 8]')
+parser.add_argument('--bn_decay_step', type=int, default=20, help='Period of BN decay (in epochs) [default: 20]')
+parser.add_argument('--bn_decay_rate', type=float, default=0.5, help='Decay rate for BN decay [default: 0.5]')
+parser.add_argument('--dump_results', action='store_true', help='Dump results.')
+FLAGS = parser.parse_args()
+
+# ==============================Argparse=======================================
+
+BATCH_SIZE = FLAGS.batch_size
+NUM_POINTS = FLAGS.num_points
+FEATURE_DIM = FLAGS.num_feature_dim
+LOG_DIR = FLAGS.log_dir
+DEFAULT_DUMP_DIR = os.path.join(BASE_DIR, os.path.basename(LOG_DIR))
+BN_DECAY_STEP = FLAGS.bn_decay_step
+BN_DECAY_RATE = FLAGS.bn_decay_rate
+DUMP_DIR = FLAGS.dump_dir if FLAGS.dump_dir is not None else DEFAULT_DUMP_DIR
+FLAGS.DUMP_DIR = DUMP_DIR
+
+# ==============================Log and Dump=========================================
+
+if not os.path.exists(LOG_DIR):
+    os.mkdir(LOG_DIR)
+
+LOG_FOUT = open(os.path.join(LOG_DIR, 'log_train.txt'), 'a')
+LOG_FOUT.write(str(FLAGS) + '\n')
+
+
+def log_string(out_str):
+    LOG_FOUT.write(out_str + '\n')
+    LOG_FOUT.flush()
+    print(out_str)
+
+
+if not os.path.exists(DUMP_DIR): os.mkdir(DUMP_DIR)
+
+# ==============================DatasetDataLoader=====================================
+
+
+def my_worker_init_fn(worker_id):
+    np.random.seed(np.random.get_state()[1][0] + worker_id)
+
+
+cfg.merge_from_file(os.path.join(ROOT_DIR, "e2e_relation_sgcls_votenet_slayout.yaml"))
+cfg.freeze()
+sys.path.append(os.path.join(ROOT_DIR, "model/dataset"))
+DATASET_CONFIG = DC()
+EVAL_DATASET = RScanDetectionVotesDataset(cfg, 'test', num_points=NUM_POINTS,
+                                          augment=False,
+                                          use_color=False, use_height=False)
+
+print("Len of EVAL_DATASET:" + str(len(EVAL_DATASET)))
+EVAL_DATALOADER = DataLoader(EVAL_DATASET, batch_size=BATCH_SIZE,
+                             shuffle=True, num_workers=4, worker_init_fn=my_worker_init_fn, collate_fn=my_collate_fn)
+print("Len of EVAL_DATALOADER:" + str(len(EVAL_DATALOADER)))
+
+# ================================Model=======================================
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+num_input_channel = 0
+model = Net(cfg)
+
+if torch.cuda.device_count() > 1:
+    pass
+    # dim = 0 [30, xxx] -> [10, ...], [10, ...], [10, ...] on 3 GPUs
+    # model = nn.DataParallel(model)
+    # net = model
+model.to(device)
+
+VOTENET_CHECKPOINT_PATH = cfg.MODEL.BACKBONE.CKPT_DIR
+EXTRACTOR_CHECKPOINT_PATH = cfg.MODEL.ROI_RELATION_HEAD.FEATURE_EXTRACTOR_CKPT_DIR
+SUPPORTOR_CHECKPOINT_PATH = cfg.MODEL.ROI_RELATION_HEAD.SUPPORT_CKPT_DIR
+DEFAULT_CHECKPOINT_PATH = cfg.MODEL.ROI_RELATION_HEAD.CKPT_DIR
+CHECKPOINT_PATH = DEFAULT_CHECKPOINT_PATH
+model_dict = model.state_dict()
+# ===============================Load Pretrain Checkpoint(Votenet only)=============================
+
+if VOTENET_CHECKPOINT_PATH is not None and os.path.isfile(VOTENET_CHECKPOINT_PATH):
+    pretrained_dict, ckpt = load_pretrain_model(VOTENET_CHECKPOINT_PATH, multi_gpu=False)
+    model_dict.update(pretrained_dict)
+    log_string("-> loaded votenet checkpoint")
+
+# ===============================Load Pretrain Feature Extractor=====================================
+
+if EXTRACTOR_CHECKPOINT_PATH is not None and os.path.isfile(EXTRACTOR_CHECKPOINT_PATH):
+    extractor_checkpoint = torch.load(EXTRACTOR_CHECKPOINT_PATH)
+    ckpt_dict = extractor_checkpoint['model_state_dict']
+    # processed_dict = load_ckpt_from_single_gpu_to_multi_gpu(checkpoint['model_state_dict'])
+    for k in list(ckpt_dict.keys()):
+        if 'feat_extractor' not in k:
+            ckpt_dict.pop(k)
+    model_dict.update(ckpt_dict)
+    log_string("-> loaded feature extractor checkpoint")
+
+# ===============================Load Support Relation Detector=====================================
+
+if SUPPORTOR_CHECKPOINT_PATH is not None and os.path.isfile(SUPPORTOR_CHECKPOINT_PATH):
+    supportor_checkpoint = torch.load(SUPPORTOR_CHECKPOINT_PATH)
+    ckpt_dict = supportor_checkpoint['model_state_dict']
+    # processed_dict = load_ckpt_from_single_gpu_to_multi_gpu(checkpoint['model_state_dict'])
+    for k in list(ckpt_dict.keys()):
+        if 'support_detector' not in k:
+            ckpt_dict.pop(k)
+    model_dict.update(ckpt_dict)
+    log_string("-> loaded support constructor checkpoint")
+
+# ===============================Load Checkpoint(whole model)========================================
+
+it = -1
+start_epoch = 0
+if CHECKPOINT_PATH is not None and os.path.isfile(CHECKPOINT_PATH):
+    checkpoint = torch.load(CHECKPOINT_PATH)
+    ckpt_dict = checkpoint['model_state_dict']
+    # processed_dict = load_ckpt_from_single_gpu_to_multi_gpu(checkpoint['model_state_dict'])
+    model_dict.update(ckpt_dict)
+    start_epoch = checkpoint['epoch']
+    log_string("-> loaded checkpoint %s (epoch: %d)" % (CHECKPOINT_PATH, start_epoch))
+
+model.load_state_dict(model_dict)
+# ==================================BN=========================================
+
+BN_MOMENTUM_INIT = 0.5
+BN_MOMENTUM_MAX = 0.001
+bn_lbmd = lambda it: max(BN_MOMENTUM_INIT * BN_DECAY_RATE ** (int(it / BN_DECAY_STEP)), BN_MOMENTUM_MAX)
+bnm_scheduler = BNMomentumScheduler(model, bn_lambda=bn_lbmd, last_epoch=start_epoch - 1)
+
+# ===================================MISC=========================================
+
+CONFIG_DICT = {'remove_empty_box': False, 'use_3d_nms': True,
+               'nms_iou': 0.25, 'use_old_type_nms': False, 'cls_nms': True,
+               'per_class_proposal': True, 'conf_thresh': 0.05,
+               'dataset_config': DATASET_CONFIG}
+
+
+def fix_votenet_module(model, multi_gpu=True):
+    if multi_gpu:
+        model.module.detector.eval()
+        for _, param in model.module.detector.named_parameters():
+            param.requires_grad = False
+    else:
+        model.detector.eval()
+        for _, param in model.detector.named_parameters():
+            param.requires_grad = False
+
+
+def eval_one_epoch():
+    stat_dict = {}
+    bnm_scheduler.step()
+    model.eval()
+    r3p2 = BatchMetricProcessor(K=3, P=0.2)
+    r50p2 = RecallKProcessor(K=100, P=0.2)
+    total_topK_rel_acc = []
+    total_obj_cls_acc = []
+    total_lowp_rel_acc = []
+    total_recallK = []
+    total_mean_recallK = []
+    for batch_idx, batch_data_label in enumerate(EVAL_DATALOADER):
+        for key in batch_data_label[0].keys():
+            if isinstance(batch_data_label[0][key], torch.Tensor):
+                batch_data_label[0][key] = batch_data_label[0][key].cuda()
+
+        with torch.no_grad():
+            end_dict = model(batch_data_label[0], batch_data_label[1].cuda(), batch_data_label[2].cuda(),
+                             batch_data_label[3].cuda())
+
+        obj_labels = end_dict['obj_labels']
+        refine_logits = end_dict['refine_logits']
+        support_labels = end_dict['support_labels']
+        support_dists = end_dict['support_dists']
+        support_pairs = end_dict['support_pairs']
+        proxi_labels = end_dict['proxi_labels']
+        proxi_dists = end_dict['proxi_dists']
+        proxi_pairs = end_dict['proxi_pairs']
+
+        assert len(support_pairs) == len(proxi_pairs)
+        num_scan = len(support_pairs)
+        num_supp = [s.shape[0] for s in support_dists]
+        num_prox = [p.shape[0] for p in proxi_dists]
+        supp_rel = [1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        prox_rel = [2, 3]
+        supp_reverse_map = {}
+        for i in range(len(supp_rel)):
+            supp_reverse_map[i + 1] = supp_rel[i]
+        supp_reverse_map[0] = 0
+        prox_reverse_map = {}
+        for i in range(len(prox_rel)):
+            prox_reverse_map[i + 1] = prox_rel[i]
+        prox_reverse_map[0] = 0
+
+        rel_pairs = []
+        rel_labels = []
+        rel_dists = []
+        for k in range(num_scan):
+            for i, sup in enumerate(support_labels[k]):
+                support_labels[k][i] = supp_reverse_map[sup.item()]
+            for j, pro in enumerate(proxi_labels[k]):
+                proxi_labels[k][j] = prox_reverse_map[pro.item()]
+            rel_labels.append(torch.cat([support_labels[k], proxi_labels[k]], dim=0))
+            rel_pairs.append(torch.cat([support_pairs[k], proxi_pairs[k]], dim=0))
+            if support_dists[k].shape[0] == 0:
+                filled_support_dists = support_dists[k]
+            else:
+                filled_support_dists = torch.cat([support_dists[k][:, :2],
+                                                  torch.zeros((num_supp[k], 2), device=torch.device('cuda:0')),
+                                                  support_dists[k][:, 2:]], dim=-1)
+            if proxi_dists[k].shape[0] == 0:
+                filled_proxi_dists = proxi_dists[k]
+            else:
+                filled_proxi_dists = torch.cat([proxi_dists[k][:, 0].unsqueeze(-1),
+                                                torch.zeros((num_prox[k], 1), device=torch.device('cuda:0')),
+                                                proxi_dists[k][:, 1:],
+                                                torch.zeros((num_prox[k], 13), device=torch.device('cuda:0'))], dim=-1)
+            rel_dists.append(torch.cat([filled_support_dists, filled_proxi_dists], dim=0))
+
+        num_pred_per_scan = []
+        num_gt_per_scan = []
+        for gtscan in rel_labels:
+            num_gt_per_scan.append(gtscan.shape[0])
+        for predscan in rel_dists:
+            num_pred_per_scan.append(predscan.shape[0])
+        per_batched_gt = REL_parse_gt(rel_labels, obj_labels, rel_pairs)
+        per_batched_pred = REL_parse_output(rel_dists, refine_logits, rel_pairs)
+        r3p2.step(per_batch_gt=per_batched_gt, per_batch_pred=per_batched_pred)
+        r50p2.step(per_batch_gt=per_batched_gt, per_batch_pred=per_batched_pred,
+                   num_gt_per_scan=num_gt_per_scan, num_pred_per_scan=num_pred_per_scan)
+
+        if batch_idx % 10 == 0:
+            log_string("eval batch: %s" % batch_idx)
+
+        rk_this_batch = r50p2.computeRecallK()
+        mean_rk_this_batch = r50p2.computeMeanRecallK()
+        obj_cls_acc, total_num_obj = r3p2.compute_obj_cls_accuracy(obj_logits=refine_logits, obj_label=obj_labels)
+        t3_rel_acc, obj_cls_err = r3p2.compute_topK_rel_accuracy_sgcls()
+        l2_rel_acc = r3p2.compute_LowP_rel_accuracy_sgcls()
+        total_recallK.append(rk_this_batch)
+        total_obj_cls_acc.append(obj_cls_acc)
+        total_topK_rel_acc.append(t3_rel_acc)
+        total_lowp_rel_acc.append(l2_rel_acc)
+        total_recallK.append(rk_this_batch)
+        total_mean_recallK.append(mean_rk_this_batch)
+        log_string("Top%d Accuracy this batch: %s" % (r3p2.K, str(t3_rel_acc)))
+        log_string("Low%d Accuracy this batch: %s" % (r3p2.P, str(l2_rel_acc)))
+        log_string("Object Classification Accuracy this batch: %s" % str(obj_cls_acc))
+        log_string("Object Classification Error Induced Relation Prediction Error this batch: %s" % str(obj_cls_err))
+        log_string("Total NUM of Objects in this batch: %s" % str(total_num_obj))
+        log_string("Recall@%d this batch: %s" % (r50p2.K, str(rk_this_batch)))
+        log_string("Mean Recall@%d this batch: %s" % (r50p2.K, str(mean_rk_this_batch)))
+        r3p2.reset()
+        r50p2.reset()
+
+        del end_dict
+        torch.cuda.empty_cache()
+
+    mean_loss = {}
+    for key in sorted(stat_dict.keys()):
+        mean_loss[key] = stat_dict[key] / float(batch_idx + 1)
+
+    total_recallK = torch.as_tensor(total_recallK)
+    total_mean_recallK = torch.as_tensor(total_mean_recallK)
+    total_topK_rel_acc = torch.as_tensor(total_topK_rel_acc)
+    total_lowP_rel_acc = torch.as_tensor(total_lowp_rel_acc)
+    total_obj_cls_acc = torch.as_tensor(total_obj_cls_acc)
+    avg_recallK = total_recallK.sum(-1) / total_recallK.shape[-1]
+    avg_mean_recallK = total_mean_recallK.sum(-1) / total_mean_recallK.shape[-1]
+    avg_obj_cls = total_obj_cls_acc.sum(-1) / total_obj_cls_acc.shape[-1]
+    avg_topK_rel_acc = total_topK_rel_acc.sum(-1) / total_topK_rel_acc.shape[-1]
+    avg_lowP_rel_acc = total_lowP_rel_acc.sum(-1) / total_lowP_rel_acc.shape[-1]
+
+    log_string("Recall%d this epoch: %s" % (r50p2.K, str(avg_recallK)))
+    log_string("Mean Recall%d this epoch: %s" % (r50p2.K, str(avg_mean_recallK)))
+    log_string("Top%d Accuracy this epoch: %s" % (r3p2.K, str(avg_topK_rel_acc)))
+    log_string("Low%f Accuracy this epoch: %s" % (r3p2.P, str(avg_lowP_rel_acc)))
+    log_string("Object Classification Accuracy this epoch: %s" % str(avg_obj_cls))
+    return mean_loss
+
+
+def eval_optimal_scene():
+    model.train()
+    bnm_scheduler.step()
+    r3p2 = BatchMetricProcessor(K=3, P=0.2)
+    r50p2 = RecallKProcessor(K=50, P=0.2)
+    for batch_idx, batch_data_label in enumerate(EVAL_DATALOADER):
+        for key in batch_data_label[0].keys():
+            if isinstance(batch_data_label[0][key], torch.Tensor):
+                batch_data_label[0][key] = batch_data_label[0][key].cuda()
+
+        # Forward pass
+        with torch.no_grad():
+            end_dict = model(batch_data_label[0], batch_data_label[1].cuda(), batch_data_label[2].cuda(),
+                             batch_data_label[3].cuda())
+
+        obj_labels = end_dict['obj_labels']
+        refine_logits = end_dict['refine_logits']
+        support_labels = end_dict['support_rel_labels']
+        support_dists = end_dict['support_rel_logits']
+        support_pairs = end_dict['support_pairs']
+        proxi_labels = end_dict['proxi_rel_labels']
+        proxi_dists = end_dict['proxi_rel_logits']
+        proxi_pairs = end_dict['proxi_pairs']
+
+        num_obj_per_scan = [p.shape[0] for p in obj_labels]
+        obj_id_per_scan = list(end_dict['obj_id_this_batch'].split(num_obj_per_scan))
+
+        assert len(support_pairs) == len(proxi_pairs)
+        num_scan = len(support_pairs)
+        num_supp = [s.shape[0] for s in support_dists]
+        num_prox = [p.shape[0] for p in proxi_dists]
+        supp_rel = [1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        prox_rel = [2, 3]
+        supp_reverse_map = {}
+        for i in range(len(supp_rel)):
+            supp_reverse_map[i + 1] = supp_rel[i]
+        supp_reverse_map[0] = 0
+        prox_reverse_map = {}
+        for i in range(len(prox_rel)):
+            prox_reverse_map[i + 1] = prox_rel[i]
+        prox_reverse_map[0] = 0
+
+        rel_pairs = []
+        rel_labels = []
+        rel_dists = []
+        for k in range(num_scan):
+            for i, sup in enumerate(support_labels[k]):
+                support_labels[k][i] = supp_reverse_map[sup.item()]
+            for j, pro in enumerate(proxi_labels[k]):
+                proxi_labels[k][j] = prox_reverse_map[pro.item()]
+            rel_labels.append(torch.cat([support_labels[k], proxi_labels[k]], dim=0))
+            rel_pairs.append(torch.cat([support_pairs[k], proxi_pairs[k]], dim=0))
+            if support_dists[k].shape[0] == 0:
+                filled_support_dists = support_dists[k]
+            else:
+                filled_support_dists = torch.cat([support_dists[k][:, :2],
+                                                  torch.zeros((num_supp[k], 2), device=torch.device('cuda:0')),
+                                                  support_dists[k][:, 2:]], dim=-1)
+            if proxi_dists[k].shape[0] == 0:
+                filled_proxi_dists = proxi_dists[k]
+            else:
+                filled_proxi_dists = torch.cat([proxi_dists[k][:, 0].unsqueeze(-1),
+                                                torch.zeros((num_prox[k], 1), device=torch.device('cuda:0')),
+                                                proxi_dists[k][:, 1:],
+                                                torch.zeros((num_prox[k], 13), device=torch.device('cuda:0'))], dim=-1)
+            rel_dists.append(torch.cat([filled_support_dists, filled_proxi_dists], dim=0))
+
+        def get_acc_per_scene(labels, dists):
+            accs = []
+            error_idxs = []
+            error_fg_idxs = []
+            for label, dist in zip(labels, dists):
+                assert (label.shape[0] == dist.shape[0])
+                if label.shape[0] == 0:
+                    accs.append(0)
+                    error_idxs.append([])
+                    error_fg_idxs.append([])
+                    continue
+                num_fg = (label != 0).nonzero().squeeze(-1).shape[0]
+                pred = torch.argmax(dist[:, 1:], dim=-1) + 1
+                error_idx = (pred != label).nonzero().squeeze(-1)
+                error_fg_idx = error_idx[(label[error_idx] != 0).nonzero().squeeze(-1)]
+                num_error = error_fg_idx.shape[0]
+                num_correct = num_fg - num_error
+                accs.append(num_correct / num_fg)
+                error_idxs.append(error_idx)
+                error_fg_idxs.append(error_fg_idx)
+            return accs, error_idxs, error_fg_idxs
+
+        accs, error_idxs, error_fg_idxs = get_acc_per_scene(rel_labels, rel_dists)
+        acc_sorted = torch.sort(torch.as_tensor(accs, device=torch.device('cuda:0')), descending=True)
+
+        ordered_scan_name = []
+        ordered_support_pairs, ordered_proxi_pairs = [], []
+        ordered_support_labels, ordered_proxi_labels = [], []
+        ordered_support_preds, ordered_proxi_preds = [], []
+        ordered_obj_labels, ordered_obj_preds = [], []
+        for idx in acc_sorted[1]:
+            if support_pairs[idx.item()].shape[0] == 0 or proxi_pairs[idx.item()].shape[0] == 0:
+                continue
+            ordered_scan_name.append(batch_data_label[0]['scan_name'][idx.item()])
+            ordered_support_pairs.append(support_pairs[idx.item()])
+            ordered_proxi_pairs.append(proxi_pairs[idx.item()])
+            ordered_support_labels.append(support_labels[idx.item()])
+            ordered_proxi_labels.append(proxi_labels[idx.item()])
+            support_preds = torch.argmax(support_dists[idx.item()][:, 1:], dim=-1) + 1
+            proxi_preds = torch.argmax(proxi_dists[idx.item()][:, 1:], dim=-1) + 1
+            obj_preds = torch.argmax(refine_logits[idx.item()], dim=-1)
+            ordered_support_preds.append(support_preds)
+            ordered_proxi_preds.append(proxi_preds)
+            ordered_obj_preds.append(obj_preds)
+            ordered_obj_labels.append(obj_labels[idx.item()])
+
+        label2name = {0: "None", 1: "supported by",
+                      2: "left", 3: "front", 4: "attached to",
+                      5: "standing on", 6: "lying on",
+                      7: "hanging on", 8: "connected to", 9: "leaning against", 10: "part of",
+                      11: "belonging to",
+                      12: "build in", 13: "standing in",
+                      14: "cover", 15: "lying in", 16: "hanging in"}
+        support_label2name = {0: "None", 1: "supported by",
+                              2: "attached to",
+                              3: "standing on", 4: "lying on",
+                              5: "hanging on", 6: "connected to", 7: "leaning against", 8: "part of",
+                              9: "belonging to",
+                              10: "build in", 11: "standing in",
+                              12: "cover", 13: "lying in", 14: "hanging in"}
+        proxi_label2name = {0: "None", 1: "left", 2: "front"}
+
+        obj_label2name = {0: 'wall', 1: 'floor', 2: 'cabinet', 3: 'bed', 4: 'chair', 5: 'sofa', 6: 'table', 7: 'door',
+                          8: 'window', 9: 'counter', 10: 'shelf', 11: 'curtain', 12: 'pillow', 13: 'clothes',
+                          14: 'fridge', 15: 'tv',
+                          16: 'towel', 17: 'plant', 18: 'box', 19: 'nightstand', 20: 'toilet', 21: 'sink', 22: 'lamp',
+                          23: 'bathtub', 24: 'object', 25: 'blanket'}
+        id2name = {}
+        for id, label in zip(obj_id_per_scan[acc_sorted[1][0].item()], ordered_obj_labels[0]):
+            id2name[id.item()] = obj_label2name[label.item()]
+
+        support_gt_triplets, support_triplets= [], []
+        support_gt_triplets_with_name , support_triplets_with_name = [], []
+        for support_pair, support_label, support_pred in zip(ordered_support_pairs[0], ordered_support_labels[0],
+                                                             ordered_support_preds[0]):
+            support_sub_id = obj_id_per_scan[acc_sorted[1][0].item()][support_pair[0].item()].item()
+            support_obj_id = obj_id_per_scan[acc_sorted[1][0].item()][support_pair[1].item()].item()
+            support_sub_name = id2name[support_sub_id]
+            support_obj_name = id2name[support_obj_id]
+            support_gt_triplets.append([support_sub_id, support_obj_id, label2name[support_label.item()]])
+            support_triplets.append([support_sub_id, support_obj_id, support_label2name[support_pred.item()]])
+            support_gt_triplets_with_name.append([support_sub_name, support_obj_name, label2name[support_label.item()]])
+            support_triplets_with_name.append([support_sub_name, support_obj_name, support_label2name[support_pred.item()]])
+        proxi_gt_triplets, proxi_triplets = [], []
+        proxi_gt_triplets_with_name, proxi_triplets_with_name = [], []
+        for proxi_pair, proxi_label, proxi_pred in zip(ordered_proxi_pairs[0], ordered_proxi_labels[0],
+                                                       ordered_proxi_preds[0]):
+            proxi_sub_id = obj_id_per_scan[acc_sorted[1][0].item()][proxi_pair[0].item()].item()
+            proxi_obj_id = obj_id_per_scan[acc_sorted[1][0].item()][proxi_pair[1].item()].item()
+            proxi_sub_name = id2name[proxi_sub_id]
+            proxi_obj_name = id2name[proxi_obj_id]
+            proxi_gt_triplets.append([proxi_sub_id, proxi_obj_id, label2name[proxi_label.item()]])
+            proxi_triplets.append([proxi_sub_id, proxi_obj_id, proxi_label2name[proxi_pred.item()]])
+            proxi_gt_triplets_with_name.append([proxi_sub_name, proxi_obj_name, label2name[proxi_label.item()]])
+            proxi_triplets_with_name.append([proxi_sub_name, proxi_obj_name, proxi_label2name[proxi_pred.item()]])
+
+        assert len(support_gt_triplets) == support_pairs[0].shape[0]
+        assert len(proxi_gt_triplets) == proxi_pairs[0].shape[0]
+
+        r3p2.reset()
+        r50p2.reset()
+
+        del end_dict
+        torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    fix_votenet_module(model, multi_gpu=False)
+    eval_one_epoch()
+
