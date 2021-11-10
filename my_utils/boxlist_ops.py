@@ -12,16 +12,6 @@ DC = RScanDatasetConfig()
 
 
 def boxlist_nms(boxlist, nms_thresh, max_proposals=-1, score_field="pred_score"):
-    """
-    在一个box3dlist上做NMS
-    NMS现在还是残桩状态
-    Arguments:
-        boxlist(Box3dList)
-        nms_thresh (float)
-        max_proposals (int): if > 0, then only the top max_proposals are kept
-            after non-maximum suppression
-        score_field (str)
-    """
     if nms_thresh <= 0:
         return boxlist
     boxes = boxlist.bbox
@@ -34,9 +24,6 @@ def boxlist_nms(boxlist, nms_thresh, max_proposals=-1, score_field="pred_score")
 
 
 def remove_small_boxes(boxlist, min_size):
-    """
-    删除面积过小的box
-    """
     keep = np.argwhere((boxlist.area(DC) >= min_size) > 0)
     boxlist.clip(keep)
     return boxlist

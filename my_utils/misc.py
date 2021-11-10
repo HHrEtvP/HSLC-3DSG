@@ -33,9 +33,6 @@ def list2str(list):
 
 
 def cat(tensors, dim=0):
-    """
-    一个"更高效"的torch.cat
-    """
     assert isinstance(tensors, (list, tuple))
     if len(tensors) == 1:
         return tensors[0]
@@ -49,11 +46,6 @@ def get_3rscan_statics(cfg):
 
 
 def line2space(str):
-    """
-    将box_head类型的字符串转换成box head
-    :param str:
-    :return:
-    """
     if isinstance(str, list):
         new_list = []
         for s in str:
@@ -69,11 +61,6 @@ def line2space(str):
 
 
 def space2line(str):
-    """
-    将box head类型的字符串转换成box_head
-    :param str:
-    :return:
-    """
     if str.find(" ")>0:
         seperator = "_"
         str = seperator.join(str.split(" "))
