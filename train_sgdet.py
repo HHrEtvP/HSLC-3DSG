@@ -472,7 +472,3 @@ def train():
 if __name__ == "__main__":
     train()
 
-    # min_loss = 1e10
-    # loss = 0
-    # fix_votenet_module(model, multi_gpu=False)
-    # eval_one_epoch()
